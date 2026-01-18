@@ -1,0 +1,308 @@
+import { useEffect, useRef, useState } from 'react';
+
+const API_URL = 'https://sync.fa11eaaf.er.aliyun-esa.net/';
+const COLORS = ['#000000', '#FF0000', '#00FF00', '#0000FF', '#FFFF00', '#FF00FF'];
+
+export default function App() {
+  const canvasRef = useRef(null);
+  const ctxRef = useRef(null);
+
+  const [color, setColor] = useState('#000000');
+  const [lineWidth, setLineWidth] = useState(3);
+  const [isOnline, setIsOnline] = useState(true);
+
+  // 用户信息
+  const userIdRef = useRef(`user_${Math.random().toString(36).slice(2)}`);
+  const userNameRef = useRef(`用户${Math.floor(Math.random() * 1000)}`);
+
+  // 本地绘制状态
+  const drawingRef = useRef(false);
+  const currentStrokeIdRef = useRef(null);
+  const pointsRef = useRef([]);
+
+  // 同步状态
+  const lastSyncRef = useRef(0);
+  const receivedStrokesRef = useRef(new Set()); // 记录已接收的笔画ID
+
+  /* ================= 初始化画布 ================= */
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+
+    const ctx = canvas.getContext('2d');
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctxRef.current = ctx;
+
+    const onResize = () => {
+      const image = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+      ctx.putImageData(image, 0, 0);
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+    };
+
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+
+  /* ================= 同步轮询 ================= */
+  useEffect(() => {
+    const syncFromServer = async () => {
+      try {
+        const res = await fetch(`${API_URL}?since=${lastSyncRef.current}`);
+        
+        if (!res.ok) {
+          setIsOnline(false);
+          return;
+        }
+
+        const data = await res.json();
+        setIsOnline(true);
+
+        if (!data.actions || data.actions.length === 0) return;
+
+        const ctx = ctxRef.current;
+        let maxTs = lastSyncRef.current;
+
+        data.actions.forEach(action => {
+          maxTs = Math.max(maxTs, action.timestamp || 0);
+
+          // 不处理自己的操作
+          if (action.userId === userIdRef.current) return;
+
+          // 处理笔画
+          if (action.type === 'stroke') {
+            // 防止重复绘制
+            if (receivedStrokesRef.current.has(action.strokeId)) return;
+            receivedStrokesRef.current.add(action.strokeId);
+
+            drawStroke(ctx, action.points, action.color, action.lineWidth);
+          }
+
+          // 处理清空
+          if (action.type === 'clear') {
+            ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+            receivedStrokesRef.current.clear();
+          }
+        });
+
+        lastSyncRef.current = maxTs;
+      } catch (e) {
+        console.error('同步失败', e);
+        setIsOnline(false);
+      }
+    };
+
+    // 初始同步
+    syncFromServer();
+
+    // 定期同步
+    const timer = setInterval(syncFromServer, 200);
+    return () => clearInterval(timer);
+  }, []);
+
+  /* ================= 绘制笔画辅助函数 ================= */
+  const drawStroke = (ctx, points, color, lineWidth) => {
+    if (!points || points.length < 2) return;
+
+    ctx.strokeStyle = color;
+    ctx.lineWidth = lineWidth;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+
+    ctx.beginPath();
+    ctx.moveTo(points[0].x, points[0].y);
+
+    for (let i = 1; i < points.length; i++) {
+      const point = points[i];
+      ctx.lineTo(point.x, point.y);
+    }
+
+    ctx.stroke();
+  };
+
+  /* ================= 发送动作 ================= */
+  const sendAction = async (action) => {
+    try {
+      const response = await fetch(API_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...action,
+          userId: userIdRef.current,
+          userName: userNameRef.current,
+          timestamp: Date.now(),
+        }),
+      });
+
+      if (!response.ok) {
+        console.error('发送失败: HTTP', response.status);
+        setIsOnline(false);
+      } else {
+        setIsOnline(true);
+      }
+    } catch (e) {
+      console.error('发送失败', e);
+      setIsOnline(false);
+    }
+  };
+
+  /* ================= 获取坐标（统一处理鼠标和触摸） ================= */
+  const getCoordinates = (e) => {
+    const rect = canvasRef.current.getBoundingClientRect();
+    
+    // 处理触摸事件
+    if (e.touches && e.touches.length > 0) {
+      return {
+        x: e.touches[0].clientX - rect.left,
+        y: e.touches[0].clientY - rect.top
+      };
+    }
+    
+    // 处理鼠标事件
+    return {
+      x: e.clientX - rect.left,
+      y: e.clientY - rect.top
+    };
+  };
+
+  /* ================= 本地绘制 ================= */
+  const startDrawing = (e) => {
+    e.preventDefault();
+    
+    const { x, y } = getCoordinates(e);
+
+    drawingRef.current = true;
+    currentStrokeIdRef.current = `${userIdRef.current}_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+
+    // 重置点数组并添加第一个点
+    pointsRef.current = [{ x, y }];
+
+    const ctx = ctxRef.current;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = lineWidth;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+  };
+
+  const draw = (e) => {
+    if (!drawingRef.current) return;
+    e.preventDefault();
+
+    const { x, y } = getCoordinates(e);
+    const ctx = ctxRef.current;
+
+    // 添加到点数组
+    pointsRef.current.push({ x, y });
+
+    // 本地绘制
+    ctx.lineTo(x, y);
+    ctx.stroke();
+  };
+
+  const stopDrawing = (e) => {
+    if (!drawingRef.current) return;
+    if (e) e.preventDefault();
+
+    drawingRef.current = false;
+
+    // 发送完整的笔画（只发送一次）
+    if (pointsRef.current.length > 0) {
+      // 标记为已接收（避免接收自己的笔画）
+      receivedStrokesRef.current.add(currentStrokeIdRef.current);
+
+      sendAction({
+        type: 'stroke',
+        strokeId: currentStrokeIdRef.current,
+        points: pointsRef.current,
+        color,
+        lineWidth,
+      });
+    }
+
+    // 清除当前笔画数据
+    pointsRef.current = [];
+    currentStrokeIdRef.current = null;
+  };
+
+  /* ================= 清空 ================= */
+  const clearCanvas = () => {
+    const ctx = ctxRef.current;
+    ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+    receivedStrokesRef.current.clear();
+    sendAction({ type: 'clear' });
+  };
+
+  /* ================= UI ================= */
+  return (
+    <div className="fixed inset-0">
+      <canvas
+        ref={canvasRef}
+        // 鼠标事件
+        onMouseDown={startDrawing}
+        onMouseMove={draw}
+        onMouseUp={stopDrawing}
+        onMouseLeave={stopDrawing}
+        // 触摸事件
+        onTouchStart={startDrawing}
+        onTouchMove={draw}
+        onTouchEnd={stopDrawing}
+        onTouchCancel={stopDrawing}
+        className="cursor-crosshair touch-none"
+        style={{ touchAction: 'none' }}
+      />
+
+      {/* 工具栏 */}
+      <div className="fixed top-4 left-1/2 -translate-x-1/2 bg-white rounded-lg shadow-lg p-3 flex gap-2 md:gap-3 z-10 items-center">
+        {COLORS.map(c => (
+          <button
+            key={c}
+            onClick={() => setColor(c)}
+            className={`w-6 h-6 md:w-8 md:h-8 rounded-full border-2 transition ${
+              color === c ? 'border-gray-800 scale-110' : 'border-gray-300'
+            }`}
+            style={{ backgroundColor: c }}
+          />
+        ))}
+
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-gray-600 hidden md:inline">粗细</span>
+          <input
+            type="range"
+            min="1"
+            max="20"
+            value={lineWidth}
+            onChange={e => setLineWidth(Number(e.target.value))}
+            className="w-16 md:w-24"
+          />
+          <span className="text-xs text-gray-600 w-6">{lineWidth}</span>
+        </div>
+
+        <button
+          onClick={clearCanvas}
+          className="px-2 py-1 md:px-3 md:py-1 bg-red-500 hover:bg-red-600 text-white rounded text-sm transition"
+        >
+          清空
+        </button>
+      </div>
+
+      {/* 用户信息 */}
+      <div className="fixed bottom-4 right-4 bg-white/90 px-3 py-2 rounded shadow text-sm flex items-center gap-2">
+        <div className={`w-2 h-2 rounded-full ${isOnline ? 'bg-green-500' : 'bg-red-500'}`} />
+        <span>{userNameRef.current}</span>
+      </div>
+
+      {/* 离线提示 */}
+      {!isOnline && (
+        <div className="fixed top-20 left-1/2 -translate-x-1/2 bg-yellow-100 border border-yellow-400 text-yellow-800 px-4 py-2 rounded shadow">
+          ⚠️ 同步服务离线，绘画仅保存在本地
+        </div>
+      )}
+    </div>
+  );
+}

@@ -1,0 +1,275 @@
+import { useEffect, useRef, useState } from 'react';
+
+const API_URL = 'https://sync.fa11eaaf.er.aliyun-esa.net/';
+const COLORS = ['#000000', '#FF0000', '#00FF00', '#0000FF', '#FFFF00', '#FF00FF'];
+
+export default function App() {
+  const canvasRef = useRef(null);
+  const ctxRef = useRef(null);
+
+  const [color, setColor] = useState('#000000');
+  const [lineWidth, setLineWidth] = useState(3);
+
+  // 用户信息
+  const userIdRef = useRef(`user_${Math.random().toString(36).slice(2)}`);
+  const userNameRef = useRef(`用户${Math.floor(Math.random() * 1000)}`);
+
+  // 本地绘制状态
+  const drawingRef = useRef(false);
+  const currentStrokeIdRef = useRef(null);
+  const pointsRef = useRef([]); // 存储当前笔画的所有点
+
+  // 同步状态
+  const lastSyncRef = useRef(0);
+
+  /* ================= 初始化画布 ================= */
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+
+    const ctx = canvas.getContext('2d');
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctxRef.current = ctx;
+
+    const onResize = () => {
+      const image = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+      ctx.putImageData(image, 0, 0);
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+    };
+
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+
+  /* ================= 同步轮询 ================= */
+  useEffect(() => {
+    const timer = setInterval(async () => {
+      try {
+        const res = await fetch(`${API_URL}?since=${lastSyncRef.current}`);
+        const data = await res.json();
+        if (!data.actions) return;
+
+        const ctx = ctxRef.current;
+        let maxTs = lastSyncRef.current;
+
+        data.actions.forEach(action => {
+          maxTs = Math.max(maxTs, action.timestamp);
+
+          // 不处理自己的操作
+          if (action.userId === userIdRef.current) return;
+
+          if (action.type === 'stroke') {
+            // 绘制完整的笔画
+            drawStroke(ctx, action.points, action.color, action.lineWidth);
+          }
+
+          if (action.type === 'clear') {
+            ctx.clearRect(
+              0,
+              0,
+              canvasRef.current.width,
+              canvasRef.current.height
+            );
+          }
+        });
+
+        lastSyncRef.current = maxTs;
+      } catch (e) {
+        console.error('同步失败', e);
+      }
+    }, 100);
+
+    return () => clearInterval(timer);
+  }, []);
+
+  /* ================= 绘制笔画辅助函数 ================= */
+  const drawStroke = (ctx, points, color, lineWidth) => {
+    if (points.length < 2) return;
+
+    ctx.strokeStyle = color;
+    ctx.lineWidth = lineWidth;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+
+    ctx.beginPath();
+    ctx.moveTo(points[0].x, points[0].y);
+
+    // 绘制平滑曲线
+    for (let i = 1; i < points.length; i++) {
+      const point = points[i];
+      ctx.lineTo(point.x, point.y);
+    }
+
+    ctx.stroke();
+  };
+
+  /* ================= 发送动作 ================= */
+  const sendAction = async (action) => {
+    try {
+      await fetch(API_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...action,
+          userId: userIdRef.current,
+          userName: userNameRef.current,
+        }),
+      });
+    } catch (e) {
+      console.error('发送失败', e);
+    }
+  };
+
+  /* ================= 获取坐标（统一处理鼠标和触摸） ================= */
+  const getCoordinates = (e) => {
+    const rect = canvasRef.current.getBoundingClientRect();
+    
+    // 处理触摸事件
+    if (e.touches && e.touches.length > 0) {
+      return {
+        x: e.touches[0].clientX - rect.left,
+        y: e.touches[0].clientY - rect.top
+      };
+    }
+    
+    // 处理鼠标事件
+    return {
+      x: e.clientX - rect.left,
+      y: e.clientY - rect.top
+    };
+  };
+
+  /* ================= 本地绘制 ================= */
+  const startDrawing = (e) => {
+    e.preventDefault(); // 防止触摸时的默认行为（如页面滚动）
+    
+    const { x, y } = getCoordinates(e);
+
+    drawingRef.current = true;
+    currentStrokeIdRef.current = Date.now() + '_' + Math.random().toString(36).slice(2);
+
+    // 重置点数组并添加第一个点
+    pointsRef.current = [{ x, y }];
+
+    const ctx = ctxRef.current;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = lineWidth;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+  };
+
+  const draw = (e) => {
+    if (!drawingRef.current) return;
+    e.preventDefault(); // 防止触摸时的默认行为
+
+    const { x, y } = getCoordinates(e);
+    const ctx = ctxRef.current;
+
+    // 添加到点数组
+    pointsRef.current.push({ x, y });
+
+    // 本地绘制
+    ctx.lineTo(x, y);
+    ctx.stroke();
+
+    // 实时同步每个点（可考虑优化为批量发送）
+    sendAction({
+      type: 'point',
+      strokeId: currentStrokeIdRef.current,
+      x,
+      y,
+      color,
+      lineWidth,
+    });
+  };
+
+  const stopDrawing = (e) => {
+    if (!drawingRef.current) return;
+    if (e) e.preventDefault();
+
+    drawingRef.current = false;
+
+    // 发送完整的笔画
+    if (pointsRef.current.length > 1) {
+      sendAction({
+        type: 'stroke',
+        strokeId: currentStrokeIdRef.current,
+        points: pointsRef.current,
+        color,
+        lineWidth,
+      });
+    }
+
+    // 清除当前笔画数据
+    pointsRef.current = [];
+    currentStrokeIdRef.current = null;
+  };
+
+  /* ================= 清空 ================= */
+  const clearCanvas = () => {
+    const ctx = ctxRef.current;
+    ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+    sendAction({ type: 'clear' });
+  };
+
+  /* ================= UI ================= */
+  return (
+    <div className="fixed inset-0">
+      <canvas
+        ref={canvasRef}
+        // 鼠标事件
+        onMouseDown={startDrawing}
+        onMouseMove={draw}
+        onMouseUp={stopDrawing}
+        onMouseLeave={stopDrawing}
+        // 触摸事件
+        onTouchStart={startDrawing}
+        onTouchMove={draw}
+        onTouchEnd={stopDrawing}
+        onTouchCancel={stopDrawing}
+        className="cursor-crosshair touch-none"
+        style={{ touchAction: 'none' }}
+      />
+
+      <div className="fixed top-4 left-1/2 -translate-x-1/2 bg-white rounded-lg shadow p-3 flex gap-2 md:gap-3 z-10 items-center">
+        {COLORS.map(c => (
+          <button
+            key={c}
+            onClick={() => setColor(c)}
+            className={`w-6 h-6 md:w-8 md:h-8 rounded-full border-2 transition ${
+              color === c ? 'border-gray-800 scale-110' : 'border-gray-300'
+            }`}
+            style={{ backgroundColor: c }}
+          />
+        ))}
+
+        <input
+          type="range"
+          min="1"
+          max="20"
+          value={lineWidth}
+          onChange={e => setLineWidth(Number(e.target.value))}
+          className="w-16 md:w-24"
+        />
+
+        <button
+          onClick={clearCanvas}
+          className="px-2 py-1 md:px-3 md:py-1 bg-red-500 text-white rounded text-sm"
+        >
+          清空
+        </button>
+      </div>
+
+      <div className="fixed bottom-4 right-4 bg-white/90 px-3 py-2 rounded text-sm">
+        {userNameRef.current}
+      </div>
+    </div>
+  );
+}

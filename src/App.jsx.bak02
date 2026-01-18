@@ -1,0 +1,380 @@
+import { useEffect, useRef, useState } from 'react';
+
+const API_URL = 'https://sync.fa11eaaf.er.aliyun-esa.net/';
+const COLORS = ['#000000', '#FF0000', '#00FF00', '#0000FF', '#FFFF00', '#FF00FF'];
+
+// 优化配置
+const SYNC_INTERVAL = 500;  // 增加到500ms，减少请求频率
+const BATCH_SEND_DELAY = 200;  // 200ms内的笔画批量发送
+const MAX_POINTS_PER_STROKE = 50;  // 每个笔画最多50个点
+
+export default function App() {
+  const canvasRef = useRef(null);
+  const ctxRef = useRef(null);
+
+  const [color, setColor] = useState('#000000');
+  const [lineWidth, setLineWidth] = useState(3);
+  const [isOnline, setIsOnline] = useState(true);
+  const [debugInfo, setDebugInfo] = useState('');
+
+  // 用户信息
+  const userIdRef = useRef(`user_${Math.random().toString(36).slice(2)}`);
+  const userNameRef = useRef(`用户${Math.floor(Math.random() * 1000)}`);
+
+  // 本地绘制状态
+  const drawingRef = useRef(false);
+  const currentStrokeIdRef = useRef(null);
+  const pointsRef = useRef([]);
+
+  // 批量发送队列
+  const sendQueueRef = useRef([]);
+  const sendTimerRef = useRef(null);
+
+  // 同步状态
+  const lastSyncRef = useRef(0);
+  const receivedStrokesRef = useRef(new Set());
+  const syncCountRef = useRef(0);
+
+  /* ================= 初始化画布 ================= */
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+
+    const ctx = canvas.getContext('2d');
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctxRef.current = ctx;
+
+    const onResize = () => {
+      const image = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+      ctx.putImageData(image, 0, 0);
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+    };
+
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+
+  /* ================= 批量发送机制 ================= */
+  const scheduleBatchSend = () => {
+    if (sendTimerRef.current) {
+      clearTimeout(sendTimerRef.current);
+    }
+
+    sendTimerRef.current = setTimeout(() => {
+      if (sendQueueRef.current.length > 0) {
+        const toSend = [...sendQueueRef.current];
+        sendQueueRef.current = [];
+        
+        // 并发发送所有待发送的动作
+        toSend.forEach(action => {
+          sendAction(action).catch(e => {
+            console.error('发送失败:', e);
+            // 失败的重新加入队列
+            sendQueueRef.current.push(action);
+          });
+        });
+      }
+    }, BATCH_SEND_DELAY);
+  };
+
+  /* ================= 同步轮询 ================= */
+  useEffect(() => {
+    const syncFromServer = async () => {
+      try {
+        const url = `${API_URL}?since=${lastSyncRef.current}`;
+        const res = await fetch(url);
+
+        if (!res.ok) {
+          console.error('同步失败: HTTP', res.status);
+          setIsOnline(false);
+          return;
+        }
+
+        const data = await res.json();
+        setIsOnline(true);
+        syncCountRef.current++;
+
+        // 更新调试信息
+        setDebugInfo(`同步: ${syncCountRef.current} | 新动作: ${data.actions?.length || 0} | 总: ${data.totalActions || 0}`);
+
+        if (!data.actions || data.actions.length === 0) return;
+
+        const ctx = ctxRef.current;
+        let maxTs = lastSyncRef.current;
+        let drawnCount = 0;
+
+        // 批量绘制（提高性能）
+        data.actions.forEach(action => {
+          maxTs = Math.max(maxTs, action.timestamp || 0);
+
+          // 跳过自己的和已接收的
+          if (action.userId === userIdRef.current) return;
+          if (receivedStrokesRef.current.has(action.strokeId)) return;
+
+          receivedStrokesRef.current.add(action.strokeId);
+
+          // 处理笔画
+          if (action.type === 'stroke') {
+            drawStroke(ctx, action.points, action.color, action.lineWidth);
+            drawnCount++;
+          }
+
+          // 处理清空
+          if (action.type === 'clear') {
+            ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+            receivedStrokesRef.current.clear();
+          }
+        });
+
+        if (drawnCount > 0) {
+          console.log(`绘制了 ${drawnCount} 个新笔画`);
+        }
+
+        lastSyncRef.current = maxTs;
+        
+      } catch (e) {
+        console.error('同步异常:', e);
+        setIsOnline(false);
+      }
+    };
+
+    // 初始同步
+    syncFromServer();
+
+    // 定期同步 - 500ms
+    const timer = setInterval(syncFromServer, SYNC_INTERVAL);
+    return () => clearInterval(timer);
+  }, []);
+
+  /* ================= 绘制笔画辅助函数 ================= */
+  const drawStroke = (ctx, points, color, lineWidth) => {
+    if (!points || points.length < 2) return;
+
+    ctx.strokeStyle = color;
+    ctx.lineWidth = lineWidth;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+
+    ctx.beginPath();
+    ctx.moveTo(points[0].x, points[0].y);
+
+    for (let i = 1; i < points.length; i++) {
+      ctx.lineTo(points[i].x, points[i].y);
+    }
+
+    ctx.stroke();
+  };
+
+  /* ================= 发送动作（支持批量） ================= */
+  const sendAction = async (action) => {
+    try {
+      const response = await fetch(API_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...action,
+          userId: userIdRef.current,
+          userName: userNameRef.current,
+          timestamp: Date.now(),
+        }),
+      });
+
+      if (!response.ok) {
+        console.error('发送失败: HTTP', response.status);
+        setIsOnline(false);
+        throw new Error(`HTTP ${response.status}`);
+      } else {
+        const result = await response.json();
+        setIsOnline(true);
+        return result;
+      }
+    } catch (e) {
+      console.error('发送异常:', e);
+      setIsOnline(false);
+      throw e;
+    }
+  };
+
+  /* ================= 获取坐标 ================= */
+  const getCoordinates = (e) => {
+    const rect = canvasRef.current.getBoundingClientRect();
+
+    if (e.touches && e.touches.length > 0) {
+      return {
+        x: e.touches[0].clientX - rect.left,
+        y: e.touches[0].clientY - rect.top
+      };
+    }
+
+    return {
+      x: e.clientX - rect.left,
+      y: e.clientY - rect.top
+    };
+  };
+
+  /* ================= 本地绘制 ================= */
+  const startDrawing = (e) => {
+    e.preventDefault();
+
+    const { x, y } = getCoordinates(e);
+
+    drawingRef.current = true;
+    currentStrokeIdRef.current = `${userIdRef.current}_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    pointsRef.current = [{ x, y }];
+
+    const ctx = ctxRef.current;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = lineWidth;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+  };
+
+  const draw = (e) => {
+    if (!drawingRef.current) return;
+    e.preventDefault();
+
+    const { x, y } = getCoordinates(e);
+    const ctx = ctxRef.current;
+
+    pointsRef.current.push({ x, y });
+
+    // 本地绘制
+    ctx.lineTo(x, y);
+    ctx.stroke();
+
+    // 优化：如果点太多，分段发送
+    if (pointsRef.current.length >= MAX_POINTS_PER_STROKE) {
+      sendCurrentStroke();
+      
+      // 开始新的笔画段
+      const lastPoint = pointsRef.current[pointsRef.current.length - 1];
+      currentStrokeIdRef.current = `${userIdRef.current}_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+      pointsRef.current = [lastPoint];
+      ctx.beginPath();
+      ctx.moveTo(lastPoint.x, lastPoint.y);
+    }
+  };
+
+  const stopDrawing = (e) => {
+    if (!drawingRef.current) return;
+    if (e) e.preventDefault();
+
+    drawingRef.current = false;
+
+    // 发送完整的笔画
+    sendCurrentStroke();
+
+    // 清除
+    pointsRef.current = [];
+    currentStrokeIdRef.current = null;
+  };
+
+  // 发送当前笔画
+  const sendCurrentStroke = () => {
+    if (pointsRef.current.length === 0) return;
+
+    const action = {
+      type: 'stroke',
+      strokeId: currentStrokeIdRef.current,
+      points: [...pointsRef.current],  // 复制数组
+      color,
+      lineWidth,
+    };
+
+    // 标记为已接收（避免接收自己的）
+    receivedStrokesRef.current.add(currentStrokeIdRef.current);
+
+    // 加入发送队列
+    sendQueueRef.current.push(action);
+    scheduleBatchSend();
+  };
+
+  /* ================= 清空 ================= */
+  const clearCanvas = () => {
+    const ctx = ctxRef.current;
+    ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+    receivedStrokesRef.current.clear();
+    
+    // 立即发送清空命令
+    sendAction({ type: 'clear' });
+  };
+
+  /* ================= UI ================= */
+  return (
+    <div className="fixed inset-0">
+      <canvas
+        ref={canvasRef}
+        onMouseDown={startDrawing}
+        onMouseMove={draw}
+        onMouseUp={stopDrawing}
+        onMouseLeave={stopDrawing}
+        onTouchStart={startDrawing}
+        onTouchMove={draw}
+        onTouchEnd={stopDrawing}
+        onTouchCancel={stopDrawing}
+        className="cursor-crosshair touch-none"
+        style={{ touchAction: 'none' }}
+      />
+
+      {/* 工具栏 */}
+      <div className="fixed top-4 left-1/2 -translate-x-1/2 bg-white rounded-lg shadow-lg p-3 flex gap-2 md:gap-3 z-10 items-center">
+        {COLORS.map(c => (
+          <button
+            key={c}
+            onClick={() => setColor(c)}
+            className={`w-6 h-6 md:w-8 md:h-8 rounded-full border-2 transition ${
+              color === c ? 'border-gray-800 scale-110' : 'border-gray-300'
+            }`}
+            style={{ backgroundColor: c }}
+          />
+        ))}
+
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-gray-600 hidden md:inline">粗细</span>
+          <input
+            type="range"
+            min="1"
+            max="20"
+            value={lineWidth}
+            onChange={e => setLineWidth(Number(e.target.value))}
+            className="w-16 md:w-24"
+          />
+          <span className="text-xs text-gray-600 w-6">{lineWidth}</span>
+        </div>
+
+        <button
+          onClick={clearCanvas}
+          className="px-2 py-1 md:px-3 md:py-1 bg-red-500 hover:bg-red-600 text-white rounded text-sm transition"
+        >
+          清空
+        </button>
+      </div>
+
+      {/* 状态信息 */}
+      <div className="fixed bottom-4 right-4 bg-white/90 px-3 py-2 rounded shadow text-xs flex flex-col gap-1">
+        <div className="flex items-center gap-2">
+          <div className={`w-2 h-2 rounded-full ${isOnline ? 'bg-green-500' : 'bg-red-500'}`} />
+          <span>{userNameRef.current}</span>
+        </div>
+        <div className="text-gray-600 font-mono text-[10px]">{debugInfo}</div>
+        <div className="text-gray-500 text-[10px]">
+          队列: {sendQueueRef.current.length} | 已收: {receivedStrokesRef.current.size}
+        </div>
+      </div>
+
+      {/* 离线提示 */}
+      {!isOnline && (
+        <div className="fixed top-20 left-1/2 -translate-x-1/2 bg-yellow-100 border border-yellow-400 text-yellow-800 px-4 py-2 rounded shadow text-sm">
+          ⚠️ 连接中断，正在重试...
+        </div>
+      )}
+    </div>
+  );
+}

@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>白板诊断工具 v2</title>
+  <style>
+    body {
+      font-family: monospace;
+      padding: 20px;
+      background: #f5f5f5;
+    }
+    .panel {
+      background: white;
+      padding: 20px;
+      margin: 10px 0;
+      border-radius: 8px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    .status {
+      display: inline-block;
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      margin-right: 8px;
+    }
+    .ok { background: #22c55e; }
+    .warn { background: #eab308; }
+    .error { background: #ef4444; }
+    button {
+      background: #3b82f6;
+      color: white;
+      border: none;
+      padding: 10px 20px;
+      border-radius: 6px;
+      cursor: pointer;
+      margin: 5px;
+    }
+    button:hover {
+      background: #2563eb;
+    }
+    .log {
+      background: #1e1e1e;
+      color: #22c55e;
+      padding: 15px;
+      border-radius: 6px;
+      max-height: 300px;
+      overflow-y: auto;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    .metric {
+      display: inline-block;
+      margin: 10px 20px 10px 0;
+    }
+    .metric-value {
+      font-size: 24px;
+      font-weight: bold;
+      color: #3b82f6;
+    }
+    .metric-label {
+      font-size: 12px;
+      color: #666;
+    }
+  </style>
+</head>
+<body>
+  <h1>🔍 协作白板诊断工具 v2 (新API)</h1>
+  
+  <div class="panel">
+    <h2>1️⃣ 连接测试</h2>
+    <button onclick="testConnection()">测试连接</button>
+    <button onclick="testLatency()">测试延迟</button>
+    <div id="connection-status"></div>
+  </div>
+
+  <div class="panel">
+    <h2>2️⃣ 写入测试</h2>
+    <button onclick="testSingleWrite()">单次写入</button>
+    <button onclick="testBurstWrite()">爆发写入 (10个)</button>
+    <button onclick="testRapidWrite()">极速写入 (50个)</button>
+    <div id="write-status"></div>
+  </div>
+
+  <div class="panel">
+    <h2>3️⃣ 读取测试 (新API)</h2>
+    <button onclick="testRead()">读取最近笔画</button>
+    <button onclick="testReadPerformance()">批量读取性能</button>
+    <div id="read-status"></div>
+  </div>
+
+  <div class="panel">
+    <h2>4️⃣ 端到端测试</h2>
+    <button onclick="testEndToEnd()">写入→读取→验证</button>
+    <div id="e2e-status"></div>
+  </div>
+
+  <div class="panel">
+    <h2>📊 实时指标</h2>
+    <div id="metrics">
+      <div class="metric">
+        <div class="metric-value" id="metric-success">0</div>
+        <div class="metric-label">写入成功</div>
+      </div>
+      <div class="metric">
+        <div class="metric-value" id="metric-failed">0</div>
+        <div class="metric-label">写入失败</div>
+      </div>
+      <div class="metric">
+        <div class="metric-value" id="metric-read">0</div>
+        <div class="metric-label">读取成功</div>
+      </div>
+      <div class="metric">
+        <div class="metric-value" id="metric-loss">0%</div>
+        <div class="metric-label">丢失率</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>📝 日志</h2>
+    <button onclick="clearLog()">清空日志</button>
+    <div id="log" class="log"></div>
+  </div>
+
+  <script>
+    const API_URL = 'https://sync.fa11eaaf.er.aliyun-esa.net/';
+    let metrics = {
+      success: 0,
+      failed: 0,
+      read: 0,
+      sent: 0,
+      received: 0
+    };
+
+    // 记录所有写入的strokeId
+    const sentStrokeIds = new Set();
+
+    function log(msg, type = 'info') {
+      const logEl = document.getElementById('log');
+      const time = new Date().toLocaleTimeString();
+      const color = type === 'error' ? '#ef4444' : type === 'warn' ? '#eab308' : '#22c55e';
+      logEl.innerHTML += `<div style="color: ${color}">[${time}] ${msg}</div>`;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function clearLog() {
+      document.getElementById('log').innerHTML = '';
+    }
+
+    function updateMetrics() {
+      document.getElementById('metric-success').textContent = metrics.success;
+      document.getElementById('metric-failed').textContent = metrics.failed;
+      document.getElementById('metric-read').textContent = metrics.read;
+      
+      const lossRate = metrics.sent > 0
+        ? Math.round((1 - metrics.received / metrics.sent) * 100)
+        : 0;
+      document.getElementById('metric-loss').textContent = lossRate + '%';
+    }
+
+    async function testConnection() {
+      log('🔌 测试连接 (新API需要ids参数)...');
+      
+      try {
+        // 用一个假ID测试
+        const res = await fetch(API_URL + '?ids=test_connection');
+        
+        if (res.ok) {
+          const data = await res.json();
+          log(`✅ 连接成功`, 'info');
+          log(`📦 服务器返回: ${JSON.stringify(data).slice(0, 100)}...`);
+          metrics.success++;
+        } else {
+          log(`❌ 连接失败: ${res.status} ${res.statusText}`, 'error');
+          metrics.failed++;
+        }
+      } catch (e) {
+        log(`❌ 连接异常: ${e.message}`, 'error');
+        metrics.failed++;
+      }
+      
+      updateMetrics();
+    }
+
+    async function testLatency() {
+      log('⏱️ 测试延迟 (5次)...');
+      const latencies = [];
+      
+      for (let i = 0; i < 5; i++) {
+        const start = Date.now();
+        try {
+          await fetch(API_URL + '?ids=latency_test');
+          const lat = Date.now() - start;
+          latencies.push(lat);
+          log(`  第${i+1}次: ${lat}ms`);
+        } catch (e) {
+          log(`  第${i+1}次: 失败`, 'error');
+        }
+        await new Promise(r => setTimeout(r, 100));
+      }
+      
+      const avg = Math.round(latencies.reduce((a,b) => a+b, 0) / latencies.length);
+      const max = Math.max(...latencies);
+      const min = Math.min(...latencies);
+      
+      log(`📊 延迟统计: 平均=${avg}ms, 最小=${min}ms, 最大=${max}ms`);
+      updateMetrics();
+    }
+
+    async function testSingleWrite() {
+      log('✍️ 测试单次写入...');
+      const strokeId = `test_${Date.now()}`;
+      sentStrokeIds.add(strokeId);
+      
+      try {
+        const res = await fetch(API_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            type: 'stroke',
+            userId: 'test_user',
+            userName: '测试用户',
+            strokeId: strokeId,
+            points: [{x: 100, y: 100}, {x: 200, y: 200}],
+            color: '#000000',
+            lineWidth: 3,
+            timestamp: Date.now()
+          })
+        });
+        
+        if (res.ok) {
+          const data = await res.json();
+          log(`✅ 写入成功: ${strokeId}`, 'info');
+          log(`   服务器响应: ${JSON.stringify(data)}`);
+          metrics.success++;
+          metrics.sent++;
+        } else {
+          log(`❌ 写入失败: ${res.status}`, 'error');
+          metrics.failed++;
+        }
+      } catch (e) {
+        log(`❌ 写入异常: ${e.message}`, 'error');
+        metrics.failed++;
+      }
+      
+      updateMetrics();
+    }
+
+    async function testBurstWrite() {
+      log('💥 测试爆发写入 (10个笔画, 间隔50ms)...');
+      const baseId = Date.now();
+      const ids = [];
+      
+      for (let i = 0; i < 10; i++) {
+        const strokeId = `burst_${baseId}_${i}`;
+        ids.push(strokeId);
+        sentStrokeIds.add(strokeId);
+        
+        fetch(API_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            type: 'stroke',
+            userId: 'test_user',
+            strokeId: strokeId,
+            points: [{x: i*10, y: i*10}, {x: i*10+5, y: i*10+5}],
+            color: '#000000',
+            lineWidth: 3,
+            timestamp: Date.now()
+          })
+        }).then(res => {
+          if (res.ok) {
+            log(`  ✅ 写入${i+1}: ${strokeId}`);
+            metrics.success++;
+            metrics.sent++;
+          } else {
+            log(`  ❌ 写入${i+1}失败`, 'error');
+            metrics.failed++;
+          }
+          updateMetrics();
+        });
+        
+        await new Promise(r => setTimeout(r, 50));
+      }
+      
+      log(`📋 生成的ID列表: ${ids.join(',').slice(0, 50)}...`);
+    }
+
+    async function testRapidWrite() {
+      log('🚀 测试极速写入 (50个笔画, 并发)...');
+      const baseId = Date.now();
+      const promises = [];
+      const ids = [];
+      
+      for (let i = 0; i < 50; i++) {
+        const strokeId = `rapid_${baseId}_${i}`;
+        ids.push(strokeId);
+        sentStrokeIds.add(strokeId);
+        
+        const promise = fetch(API_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            type: 'stroke',
+            userId: 'test_user',
+            strokeId: strokeId,
+            points: [{x: i, y: i}, {x: i+1, y: i+1}],
+            color: '#000000',
+            lineWidth: 3,
+            timestamp: Date.now()
+          })
+        }).then(res => {
+          if (res.ok) {
+            metrics.success++;
+            metrics.sent++;
+            return true;
+          } else {
+            metrics.failed++;
+            return false;
+          }
+        }).catch(e => {
+          metrics.failed++;
+          return false;
+        });
+        
+        promises.push(promise);
+      }
+      
+      const results = await Promise.all(promises);
+      const successCount = results.filter(r => r).length;
+      
+      log(`📊 完成: ${successCount}/50 成功`);
+      if (successCount < 50) {
+        log(`⚠️ 写入阶段丢失 ${50 - successCount} 个笔画`, 'warn');
+      }
+      
+      log(`💡 提示: 使用"读取最近笔画"按钮来验证这些数据是否真的保存了`);
+      
+      updateMetrics();
+    }
+
+    async function testRead() {
+      log('📖 测试读取最近笔画...');
+      
+      if (sentStrokeIds.size === 0) {
+        log('⚠️ 还没有写入任何笔画,先执行写入测试', 'warn');
+        return;
+      }
+      
+      // 读取最近20个strokeId
+      const recentIds = Array.from(sentStrokeIds).slice(-20);
+      log(`🔍 查询 ${recentIds.length} 个笔画...`);
+      
+      try {
+        const res = await fetch(`${API_URL}?ids=${recentIds.join(',')}`);
+        const data = await res.json();
+        
+        log(`✅ 读取成功`);
+        log(`   请求: ${recentIds.length} 个`);
+        log(`   返回: ${data.actions?.length || 0} 个`);
+        log(`   找到: ${data.found || 0} 个`);
+        
+        if (data.actions && data.actions.length > 0) {
+          log(`   最新: ${data.actions[data.actions.length - 1].strokeId}`);
+          metrics.received += data.actions.length;
+          metrics.read++;
+        }
+        
+        // 计算丢失率
+        const lossCount = recentIds.length - (data.found || 0);
+        if (lossCount > 0) {
+          log(`⚠️ 丢失 ${lossCount} 个笔画 (${Math.round(lossCount/recentIds.length*100)}%)`, 'warn');
+        } else {
+          log(`✅ 全部找到!`, 'info');
+        }
+        
+      } catch (e) {
+        log(`❌ 读取失败: ${e.message}`, 'error');
+      }
+      
+      updateMetrics();
+    }
+
+    async function testReadPerformance() {
+      log('⚡ 测试批量读取性能...');
+      
+      if (sentStrokeIds.size < 10) {
+        log('⚠️ 笔画太少,先执行"爆发写入"', 'warn');
+        return;
+      }
+      
+      const ids = Array.from(sentStrokeIds).slice(-50);
+      const latencies = [];
+      
+      // 分批读取,每批10个
+      for (let i = 0; i < Math.min(5, Math.floor(ids.length / 10)); i++) {
+        const batch = ids.slice(i * 10, (i + 1) * 10);
+        const start = Date.now();
+        
+        try {
+          await fetch(`${API_URL}?ids=${batch.join(',')}`);
+          const lat = Date.now() - start;
+          latencies.push(lat);
+          log(`  批次${i+1}: ${lat}ms (10个ID)`);
+        } catch (e) {
+          log(`  批次${i+1}: 失败`, 'error');
+        }
+      }
+      
+      const avg = Math.round(latencies.reduce((a,b) => a+b, 0) / latencies.length);
+      log(`📊 平均读取延迟: ${avg}ms (每批10个ID)`);
+      
+      updateMetrics();
+    }
+
+    async function testEndToEnd() {
+      log('🎯 端到端测试: 写入 → 读取 → 验证');
+      
+      const testId = `e2e_${Date.now()}`;
+      const testIds = [];
+      
+      // 1. 写入10个笔画
+      log('第1步: 写入10个笔画...');
+      for (let i = 0; i < 10; i++) {
+        const strokeId = `${testId}_${i}`;
+        testIds.push(strokeId);
+        
+        await fetch(API_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            type: 'stroke',
+            userId: 'test_user',
+            strokeId: strokeId,
+            points: [{x: i, y: i}, {x: i+1, y: i+1}],
+            color: '#FF0000',
+            lineWidth: 3,
+            timestamp: Date.now()
+          })
+        });
+        
+        metrics.sent++;
+      }
+      log(`✅ 写入完成: ${testIds.length} 个`);
+      
+      // 2. 等待1秒
+      log('第2步: 等待1秒...');
+      await new Promise(r => setTimeout(r, 1000));
+      
+      // 3. 读取这些笔画
+      log('第3步: 读取笔画...');
+      const res = await fetch(`${API_URL}?ids=${testIds.join(',')}`);
+      const data = await res.json();
+      
+      log(`✅ 读取完成: 返回 ${data.found || 0} 个`);
+      
+      // 4. 验证
+      log('第4步: 验证结果...');
+      const found = data.found || 0;
+      const lossRate = Math.round((1 - found / testIds.length) * 100);
+      
+      if (found === testIds.length) {
+        log(`✅✅✅ 完美! 10/10 全部找到!`, 'info');
+        log(`✅ 新API工作正常,丢失率 0%`, 'info');
+      } else {
+        log(`❌ 丢失 ${testIds.length - found} 个笔画`, 'error');
+        log(`❌ 丢失率: ${lossRate}%`, 'error');
+        
+        // 显示哪些丢失了
+        const foundIds = new Set(data.actions.map(a => a.strokeId));
+        const missing = testIds.filter(id => !foundIds.has(id));
+        log(`❌ 丢失的ID: ${missing.join(', ')}`, 'error');
+      }
+      
+      metrics.received += found;
+      updateMetrics();
+    }
+
+    // 初始化
+    log('🎯 诊断工具 v2 已就绪');
+    log('💡 新API使用方式: GET ?ids=id1,id2,id3');
+    log('💡 建议测试: 单次写入 → 端到端测试');
+  </script>
+</body>
+</html>

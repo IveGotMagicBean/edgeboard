@@ -1,0 +1,453 @@
+import { useEffect, useRef, useState } from 'react';
+
+const API_URL = 'https://sync.fa11eaaf.er.aliyun-esa.net/';
+const COLORS = ['#000000', '#FF0000', '#00FF00', '#0000FF', '#FFFF00', '#FF00FF'];
+const STORAGE_KEY = 'whiteboard-strokes-v3';
+
+export default function App() {
+  const canvasRef = useRef(null);
+  const ctxRef = useRef(null);
+
+  const [color, setColor] = useState('#000000');
+  const [lineWidth, setLineWidth] = useState(3);
+  const [isOnline, setIsOnline] = useState(true);
+  const [stats, setStats] = useState({ sent: 0, received: 0, failed: 0, pending: 0 });
+
+  // 用户信息
+  const userIdRef = useRef(`user_${Math.random().toString(36).slice(2)}`);
+  const userNameRef = useRef(`用户${Math.floor(Math.random() * 1000)}`);
+
+  // 绘制状态
+  const drawingRef = useRef(false);
+  const currentStrokeIdRef = useRef(null);
+  const pointsRef = useRef([]);
+
+  // 同步状态
+  const allStrokeIdsRef = useRef(new Map()); // id -> timestamp
+  const myStrokeIdsRef = useRef(new Set());
+  const receivedStrokesRef = useRef(new Set());
+  const pendingFetchRef = useRef(new Set());
+  
+  // 🆕 发送队列 (限流控制)
+  const sendQueueRef = useRef([]);
+  const sendingRef = useRef(false);
+  
+  // 广播通道
+  const bcRef = useRef(null);
+
+  /* ================= 初始化 ================= */
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+
+    const ctx = canvas.getContext('2d');
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctxRef.current = ctx;
+
+    // 广播通道
+    try {
+      bcRef.current = new BroadcastChannel(STORAGE_KEY);
+      bcRef.current.onmessage = (e) => {
+        if (e.data.type === 'new-stroke' && e.data.userId !== userIdRef.current) {
+          if (!allStrokeIdsRef.current.has(e.data.strokeId)) {
+            allStrokeIdsRef.current.set(e.data.strokeId, e.data.timestamp);
+            saveStrokeList();
+          }
+        }
+        if (e.data.type === 'clear') {
+          handleRemoteClear();
+        }
+      };
+    } catch (e) {
+      console.log('BroadcastChannel不可用');
+    }
+
+    // 加载历史
+    loadStrokeList();
+
+    window.addEventListener('resize', () => {
+      const image = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+      ctx.putImageData(image, 0, 0);
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+    });
+
+    return () => {
+      if (bcRef.current) bcRef.current.close();
+    };
+  }, []);
+
+  /* ================= localStorage ================= */
+  const saveStrokeList = () => {
+    try {
+      const data = {
+        strokes: Array.from(allStrokeIdsRef.current.entries()),
+        updated: Date.now()
+      };
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+    } catch (e) {
+      console.error('保存失败:', e);
+    }
+  };
+
+  const loadStrokeList = () => {
+    try {
+      const data = localStorage.getItem(STORAGE_KEY);
+      if (data) {
+        const parsed = JSON.parse(data);
+        allStrokeIdsRef.current = new Map(parsed.strokes || []);
+        console.log(`📦 恢复 ${allStrokeIdsRef.current.size} 个笔画ID`);
+      }
+    } catch (e) {
+      console.error('加载失败:', e);
+    }
+  };
+
+  /* ================= 🆕 发送队列处理 (限流) ================= */
+  useEffect(() => {
+    const processSendQueue = async () => {
+      if (sendingRef.current || sendQueueRef.current.length === 0) return;
+      
+      sendingRef.current = true;
+      
+      // 每次最多发送3个
+      const batch = sendQueueRef.current.splice(0, 3);
+      
+      try {
+        // 串行发送,避免并发限流
+        for (const action of batch) {
+          try {
+            const res = await fetch(API_URL, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(action),
+            });
+            
+            if (res.ok) {
+              const data = await res.json();
+              setStats(prev => ({ 
+                ...prev, 
+                sent: prev.sent + 1,
+                pending: sendQueueRef.current.length
+              }));
+              setIsOnline(true);
+              
+              if (data.retries > 0) {
+                console.log(`⚠️ ${action.strokeId} 重试了 ${data.retries} 次`);
+              }
+            } else {
+              // 失败了,放回队列
+              sendQueueRef.current.unshift(action);
+              setStats(prev => ({ ...prev, failed: prev.failed + 1 }));
+              setIsOnline(false);
+              break; // 停止继续发送
+            }
+          } catch (e) {
+            // 网络错误,放回队列
+            sendQueueRef.current.unshift(action);
+            setStats(prev => ({ ...prev, failed: prev.failed + 1 }));
+            setIsOnline(false);
+            break;
+          }
+          
+          // 发送间隔,避免限流
+          await new Promise(r => setTimeout(r, 50));
+        }
+      } finally {
+        sendingRef.current = false;
+      }
+    };
+
+    const timer = setInterval(processSendQueue, 100);
+    return () => clearInterval(timer);
+  }, []);
+
+  /* ================= 拉取笔画 ================= */
+  useEffect(() => {
+    const fetchStrokes = async () => {
+      try {
+        const toFetch = Array.from(allStrokeIdsRef.current.keys())
+          .filter(id => !myStrokeIdsRef.current.has(id))
+          .filter(id => !receivedStrokesRef.current.has(id))
+          .filter(id => !pendingFetchRef.current.has(id))
+          .slice(0, 20);
+
+        if (toFetch.length === 0) {
+          setIsOnline(true);
+          return;
+        }
+
+        toFetch.forEach(id => pendingFetchRef.current.add(id));
+
+        const res = await fetch(`${API_URL}?ids=${toFetch.join(',')}`, {
+          signal: AbortSignal.timeout(3000)
+        });
+
+        if (!res.ok) {
+          toFetch.forEach(id => pendingFetchRef.current.delete(id));
+          setIsOnline(false);
+          return;
+        }
+
+        const data = await res.json();
+        setIsOnline(true);
+
+        const ctx = ctxRef.current;
+        let newCount = 0;
+
+        data.actions.forEach(action => {
+          if (receivedStrokesRef.current.has(action.strokeId)) return;
+
+          receivedStrokesRef.current.add(action.strokeId);
+          pendingFetchRef.current.delete(action.strokeId);
+
+          if (action.type === 'stroke') {
+            drawStroke(ctx, action.points, action.color, action.lineWidth);
+            newCount++;
+          }
+
+          if (action.type === 'clear') {
+            handleRemoteClear();
+          }
+        });
+
+        toFetch.forEach(id => pendingFetchRef.current.delete(id));
+
+        if (newCount > 0) {
+          setStats(prev => ({ ...prev, received: prev.received + newCount }));
+        }
+
+      } catch (e) {
+        if (e.name !== 'AbortError') {
+          setIsOnline(false);
+        }
+        Array.from(pendingFetchRef.current).forEach(id => {
+          pendingFetchRef.current.delete(id);
+        });
+      }
+    };
+
+    fetchStrokes();
+    const timer = setInterval(fetchStrokes, 300);
+    return () => clearInterval(timer);
+  }, []);
+
+  /* ================= 绘制 ================= */
+  const drawStroke = (ctx, points, color, lineWidth) => {
+    if (!points || points.length < 2) return;
+
+    ctx.strokeStyle = color;
+    ctx.lineWidth = lineWidth;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+
+    ctx.beginPath();
+    ctx.moveTo(points[0].x, points[0].y);
+    for (let i = 1; i < points.length; i++) {
+      ctx.lineTo(points[i].x, points[i].y);
+    }
+    ctx.stroke();
+  };
+
+  /* ================= 加入发送队列 ================= */
+  const queueStroke = (strokeId, points, color, lineWidth) => {
+    const action = {
+      type: 'stroke',
+      userId: userIdRef.current,
+      userName: userNameRef.current,
+      strokeId: strokeId,
+      points: points,
+      color: color,
+      lineWidth: lineWidth,
+      timestamp: Date.now(),
+    };
+
+    sendQueueRef.current.push(action);
+    setStats(prev => ({ ...prev, pending: sendQueueRef.current.length }));
+
+    // 广播
+    if (bcRef.current) {
+      bcRef.current.postMessage({
+        type: 'new-stroke',
+        strokeId: strokeId,
+        timestamp: action.timestamp,
+        userId: userIdRef.current
+      });
+    }
+  };
+
+  /* ================= 获取坐标 ================= */
+  const getCoordinates = (e) => {
+    const rect = canvasRef.current.getBoundingClientRect();
+    if (e.touches && e.touches.length > 0) {
+      return {
+        x: e.touches[0].clientX - rect.left,
+        y: e.touches[0].clientY - rect.top
+      };
+    }
+    return {
+      x: e.clientX - rect.left,
+      y: e.clientY - rect.top
+    };
+  };
+
+  /* ================= 绘制事件 ================= */
+  const startDrawing = (e) => {
+    e.preventDefault();
+    const { x, y } = getCoordinates(e);
+
+    drawingRef.current = true;
+    currentStrokeIdRef.current = `${userIdRef.current}_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+    pointsRef.current = [{ x, y }];
+
+    const ctx = ctxRef.current;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = lineWidth;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+  };
+
+  const draw = (e) => {
+    if (!drawingRef.current) return;
+    e.preventDefault();
+
+    const { x, y } = getCoordinates(e);
+    pointsRef.current.push({ x, y });
+
+    const ctx = ctxRef.current;
+    ctx.lineTo(x, y);
+    ctx.stroke();
+  };
+
+  const stopDrawing = (e) => {
+    if (!drawingRef.current) return;
+    if (e) e.preventDefault();
+
+    drawingRef.current = false;
+
+    if (pointsRef.current.length > 1) {
+      const strokeId = currentStrokeIdRef.current;
+      const timestamp = Date.now();
+      
+      myStrokeIdsRef.current.add(strokeId);
+      allStrokeIdsRef.current.set(strokeId, timestamp);
+      receivedStrokesRef.current.add(strokeId);
+      saveStrokeList();
+
+      queueStroke(strokeId, [...pointsRef.current], color, lineWidth);
+    }
+
+    pointsRef.current = [];
+    currentStrokeIdRef.current = null;
+  };
+
+  /* ================= 清空 ================= */
+  const handleRemoteClear = () => {
+    const ctx = ctxRef.current;
+    ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+    receivedStrokesRef.current.clear();
+    allStrokeIdsRef.current.clear();
+    pendingFetchRef.current.clear();
+    saveStrokeList();
+  };
+
+  const clearCanvas = () => {
+    handleRemoteClear();
+    myStrokeIdsRef.current.clear();
+    sendQueueRef.current = [];
+    localStorage.removeItem(STORAGE_KEY);
+
+    if (bcRef.current) {
+      bcRef.current.postMessage({ type: 'clear' });
+    }
+
+    const clearId = `clear_${Date.now()}`;
+    fetch(API_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: 'clear',
+        userId: userIdRef.current,
+        strokeId: clearId,
+        timestamp: Date.now()
+      }),
+    }).catch(e => console.error('清空失败:', e));
+  };
+
+  /* ================= UI ================= */
+  return (
+    <div className="fixed inset-0">
+      <canvas
+        ref={canvasRef}
+        onMouseDown={startDrawing}
+        onMouseMove={draw}
+        onMouseUp={stopDrawing}
+        onMouseLeave={stopDrawing}
+        onTouchStart={startDrawing}
+        onTouchMove={draw}
+        onTouchEnd={stopDrawing}
+        onTouchCancel={stopDrawing}
+        className="cursor-crosshair touch-none"
+        style={{ touchAction: 'none' }}
+      />
+
+      <div className="fixed top-4 left-1/2 -translate-x-1/2 bg-white rounded-lg shadow-lg p-3 flex gap-2 md:gap-3 z-10 items-center">
+        {COLORS.map(c => (
+          <button
+            key={c}
+            onClick={() => setColor(c)}
+            className={`w-6 h-6 md:w-8 md:h-8 rounded-full border-2 transition ${
+              color === c ? 'border-gray-800 scale-110' : 'border-gray-300'
+            }`}
+            style={{ backgroundColor: c }}
+          />
+        ))}
+
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-gray-600 hidden md:inline">粗细</span>
+          <input
+            type="range"
+            min="1"
+            max="20"
+            value={lineWidth}
+            onChange={e => setLineWidth(Number(e.target.value))}
+            className="w-16 md:w-24"
+          />
+          <span className="text-xs text-gray-600 w-6">{lineWidth}</span>
+        </div>
+
+        <button
+          onClick={clearCanvas}
+          className="px-2 py-1 md:px-3 md:py-1 bg-red-500 hover:bg-red-600 text-white rounded text-sm transition"
+        >
+          清空
+        </button>
+      </div>
+
+      <div className="fixed bottom-4 right-4 bg-white/90 px-3 py-2 rounded shadow text-xs flex flex-col gap-1">
+        <div className="flex items-center gap-2">
+          <div className={`w-2 h-2 rounded-full ${isOnline ? 'bg-green-500' : 'bg-red-500'}`} />
+          <span>{userNameRef.current}</span>
+        </div>
+        <div className="text-gray-600 font-mono text-[10px]">
+          发送: {stats.sent} | 接收: {stats.received} | 失败: {stats.failed}
+        </div>
+        <div className="text-gray-500 font-mono text-[10px]">
+          队列: {stats.pending} | 已知: {allStrokeIdsRef.current.size}
+        </div>
+      </div>
+
+      {!isOnline && (
+        <div className="fixed top-20 left-1/2 -translate-x-1/2 bg-yellow-100 border border-yellow-400 text-yellow-800 px-4 py-2 rounded shadow text-sm">
+          ⚠️ 连接中断
+        </div>
+      )}
+    </div>
+  );
+}
